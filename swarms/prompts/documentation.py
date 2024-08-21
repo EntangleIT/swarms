@@ -2,7 +2,8 @@ def DOCUMENTATION_WRITER_SOP(
     task: str,
     module: str,
 ):
-    documentation = f"""Create multi-page long and explicit professional pytorch-like documentation for the {module} code below follow the outline for the {module} library,
+    documentation = f"""
+    Create multi-page long and explicit professional pytorch-like documentation for the {module} code below follow the outline for the {module} library,
     provide many examples and teach the user about the code, provide examples for every function, make the documentation 10,000 words,
     provide many usage examples and note this is markdown docs, create the documentation for the code to document,
     put the arguments and methods in a table in markdown to make it visually seamless
@@ -12,7 +13,7 @@ def DOCUMENTATION_WRITER_SOP(
 
     BE VERY EXPLICIT AND THOROUGH, MAKE IT DEEP AND USEFUL
 
-    ########
+    ######## INSTRUCTIONS ########
     Step 1: Understand the purpose and functionality of the module or framework
 
     Read and analyze the description provided in the documentation to understand the purpose and functionality of the module or framework.
@@ -43,6 +44,7 @@ def DOCUMENTATION_WRITER_SOP(
     Provide links to relevant documentation or websites for further exploration.
     Example Template for the given documentation:
 
+    ################################### EXAMPLE #####################################
     # Module/Function Name: MultiheadAttention
 
     class torch.nn.MultiheadAttention(embed_dim, num_heads, dropout=0.0, bias=True, add_bias_kv=False, add_zero_attn=False, kdim=None, vdim=None, batch_first=False, device=None, dtype=None):

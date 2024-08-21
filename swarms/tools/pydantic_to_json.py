@@ -2,6 +2,7 @@ from typing import Any, List
 
 from docstring_parser import parse
 from pydantic import BaseModel
+from swarms.utils.loguru_logger import logger
 
 
 def _remove_a_key(d: dict, remove_key: str) -> None:
@@ -12,6 +13,24 @@ def _remove_a_key(d: dict, remove_key: str) -> None:
                 del d[key]
             else:
                 _remove_a_key(d[key], remove_key)
+
+
+def check_pydantic_name(pydantic_type: type[BaseModel]) -> str:
+    """
+    Check the name of the Pydantic model.
+
+    Args:
+        pydantic_type (type[BaseModel]): The Pydantic model type to check.
+
+    Returns:
+        str: The name of the Pydantic model.
+
+    """
+    try:
+        return type(pydantic_type).__name__
+    except AttributeError as error:
+        logger.error(f"The Pydantic model does not have a name. {error}")
+        raise error
 
 
 def base_model_to_openai_function(
@@ -29,6 +48,9 @@ def base_model_to_openai_function(
 
     """
     schema = pydantic_type.model_json_schema()
+
+    # Fetch the name of the class
+    name = type(pydantic_type).__name__
 
     docstring = parse(pydantic_type.__doc__ or "")
     parameters = {
@@ -51,7 +73,7 @@ def base_model_to_openai_function(
             schema["description"] = docstring.short_description
         else:
             schema["description"] = (
-                f"Correctly extracted `{pydantic_type.__class__.__name__.lower()}` with all "
+                f"Correctly extracted `{name}` with all "
                 f"the required parameters with correct types"
             )
 
@@ -61,11 +83,11 @@ def base_model_to_openai_function(
     if output_str:
         out = {
             "function_call": {
-                "name": pydantic_type.__class__.__name__.lower(),
+                "name": name,
             },
             "functions": [
                 {
-                    "name": pydantic_type.__class__.__name__.lower(),
+                    "name": name,
                     "description": schema["description"],
                     "parameters": parameters,
                 },
@@ -76,11 +98,11 @@ def base_model_to_openai_function(
     else:
         return {
             "function_call": {
-                "name": pydantic_type.__class__.__name__.lower(),
+                "name": name,
             },
             "functions": [
                 {
-                    "name": pydantic_type.__class__.__name__.lower(),
+                    "name": name,
                     "description": schema["description"],
                     "parameters": parameters,
                 },
@@ -110,42 +132,3 @@ def multi_base_model_to_openai_function(
         "function_call": "auto",
         "functions": functions,
     }
-
-
-def function_to_str(function: dict[str, Any]) -> str:
-    """
-    Convert a function dictionary to a string representation.
-
-    Args:
-        function (dict[str, Any]): The function dictionary to convert.
-
-    Returns:
-        str: The string representation of the function.
-
-    """
-    function_str = f"Function: {function['name']}\n"
-    function_str += f"Description: {function['description']}\n"
-    function_str += "Parameters:\n"
-
-    for param, details in function["parameters"]["properties"].items():
-        function_str += f"  {param} ({details['type']}): {details.get('description', '')}\n"
-
-    return function_str
-
-
-def functions_to_str(functions: list[dict[str, Any]]) -> str:
-    """
-    Convert a list of function dictionaries to a string representation.
-
-    Args:
-        functions (list[dict[str, Any]]): The list of function dictionaries to convert.
-
-    Returns:
-        str: The string representation of the functions.
-
-    """
-    functions_str = ""
-    for function in functions:
-        functions_str += function_to_str(function) + "\n"
-
-    return functions_str

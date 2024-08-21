@@ -54,6 +54,10 @@ class AutoSwarmRouter(BaseSwarm):
         # Create a dictionary of swarms
         self.swarm_dict = {swarm.name: swarm for swarm in self.swarms}
 
+        logger.info(
+            f"AutoSwarmRouter has been initialized with {self.len_of_swarms()} swarms."
+        )
+
     def run(self, task: str = None, *args, **kwargs):
         try:
             """Run the swarm simulation and route the task to the appropriate swarm."""
@@ -92,6 +96,21 @@ class AutoSwarmRouter(BaseSwarm):
             logger.error(f"Error: {e}")
             raise e
 
+    def len_of_swarms(self):
+        return print(len(self.swarms))
+
+    def list_available_swarms(self):
+        for swarm in self.swarms:
+            try:
+                logger.info(
+                    f"Swarm Name: {swarm.name} || Swarm Description: {swarm.description} "
+                )
+            except Exception as error:
+                logger.error(
+                    f"Error Detected You may not have swarms available: {error}"
+                )
+                raise error
+
 
 class AutoSwarm(BaseSwarm):
     """AutoSwarm class represents a swarm of agents that can be created automatically.
@@ -116,6 +135,7 @@ class AutoSwarm(BaseSwarm):
         custom_preprocess: Optional[Callable] = None,
         custom_postprocess: Optional[Callable] = None,
         custom_router: Optional[Callable] = None,
+        max_loops: int = 1,
         *args,
         **kwargs,
     ):
@@ -126,6 +146,8 @@ class AutoSwarm(BaseSwarm):
         self.custom_params = custom_params
         self.custom_preprocess = custom_preprocess
         self.custom_postprocess = custom_postprocess
+        self.custom_router = custom_router
+        self.max_loops = max_loops
         self.router = AutoSwarmRouter(
             name=name,
             description=description,
@@ -138,12 +160,62 @@ class AutoSwarm(BaseSwarm):
             **kwargs,
         )
 
+        if name is None:
+            raise ValueError(
+                "A name must be provided for the AutoSwarm, what swarm do you want to use?"
+            )
+
+        if verbose is True:
+            self.init_logging()
+
+    def init_logging(self):
+        logger.info("AutoSwarm has been activated. Ready for usage.")
+
+    # def name_swarm_check(self, name: str = None):
+
     def run(self, task: str = None, *args, **kwargs):
         """Run the swarm simulation."""
         try:
-            return self.router.run(task, *args, **kwargs)
+            loop = 0
+
+            while loop < self.max_loops:
+                if self.custom_preprocess:
+                    # If custom preprocess function is provided then run it
+                    logger.info("Running custom preprocess function.")
+                    task, args, kwargs = self.custom_preprocess(
+                        task, args, kwargs
+                    )
+
+                if self.custom_router:
+                    # If custom router function is provided then use it to route the task
+                    logger.info("Running custom router function.")
+                    out = self.custom_router(self, task, *args, **kwargs)
+
+                else:
+                    out = self.router.run(task, *args, **kwargs)
+
+                if self.custom_postprocess:
+                    # If custom postprocess function is provided then run it
+                    out = self.custom_postprocess(out)
+
+                # LOOP
+                loop += 1
+
+                return out
         except Exception as e:
             logger.error(
                 f"Error: {e} try optimizing the inputs and try again."
             )
             raise e
+
+    def list_all_swarms(self):
+        for swarm in self.swarms:
+            try:
+                logger.info(
+                    f"Swarm Name: {swarm.name} || Swarm Description: {swarm.description} "
+                )
+            except Exception as error:
+                logger.error(
+                    f"Error Detected You may not have swarms available: {error}"
+                )
+                raise error

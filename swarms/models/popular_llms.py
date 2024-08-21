@@ -10,9 +10,10 @@ from langchain.llms.mosaicml import MosaicML
 from langchain.llms.openai import OpenAI  # , OpenAIChat, AzureOpenAI
 from langchain_community.llms.octoai_endpoint import OctoAIEndpoint
 from langchain.llms.replicate import Replicate
+from langchain_community.llms.fireworks import Fireworks  # noqa: F401
 
 
-class AnthropicChat(Anthropic):
+class Anthropic(Anthropic):
     def __call__(self, *args, **kwargs):
         return self.invoke(*args, **kwargs)
 
@@ -65,13 +66,23 @@ class OpenAIChatLLM(OpenAIChat):
         super().__init__(*args, **kwargs)
 
     def __call__(self, *args, **kwargs):
+        out = self.invoke(*args, **kwargs)
+        return out.content.strip()
+
+    def run(self, *args, **kwargs):
+        out = self.invoke(*args, **kwargs)
+        return out.content.strip()
+
+
+class OctoAIChat(OctoAIEndpoint):
+    def __call__(self, *args, **kwargs):
         return self.invoke(*args, **kwargs)
 
     def run(self, *args, **kwargs):
         return self.invoke(*args, **kwargs)
 
 
-class OctoAIChat(OctoAIEndpoint):
+class FireWorksAI(Fireworks):
     def __call__(self, *args, **kwargs):
         return self.invoke(*args, **kwargs)
 

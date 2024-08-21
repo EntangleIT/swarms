@@ -1,12 +1,11 @@
 from functools import wraps
-
 from swarms.tools.py_func_to_openai_func_str import (
     get_openai_function_schema_from_func,
 )
 from swarms.utils.loguru_logger import logger
 
 
-def create_openai_tool(
+def tool(
     name: str = None,
     description: str = None,
     return_dict: bool = True,
@@ -51,8 +50,9 @@ def create_openai_tool(
                 func(*args, **kwargs)
 
                 # Get the openai function schema
+                tool_name = name if not None else func.__name__
                 schema = get_openai_function_schema_from_func(
-                    func, name=name, description=description
+                    func, name=tool_name, description=description
                 )
 
                 # Return the schema

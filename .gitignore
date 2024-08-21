@@ -6,24 +6,42 @@ __pycache__/
 image/
 audio/
 video/
+artifacts_three
 dataframe/
 
 static/generated
 runs
+Financial-Analysis-Agent_state.json
+artifacts_five
+errors
 chroma
+agent_workspace
+.pt
+Accounting Assistant_state.json
 Unit Testing Agent_state.json
 Devin_state.json
+hire_researchers
+agent_workspace
+json_logs
+Medical Image Diagnostic Agent_state.json
+flight agent_state.json
+D_state.json
+artifacts_six
+artifacts_seven
 swarms/__pycache__
-artifacts
+artifacts_once
 transcript_generator.json
 venv
 .DS_Store
 Cargo.lock
 .DS_STORE
+artifacts_logs
 Cargo.lock
+Medical Treatment Recommendation Agent_state.json
 swarms/agents/.DS_Store
 artifacts_two
 logs
+T_state.json
 _build
 conversation.txt
 t1_state.json

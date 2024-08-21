@@ -8,16 +8,8 @@ import aiohttp
 import requests
 from dotenv import load_dotenv
 from termcolor import colored
-
+from swarms.utils.loguru_logger import logger
 from swarms.models.base_multimodal_model import BaseMultiModalModel
-
-try:
-    import cv2
-except ImportError:
-    print(
-        "OpenCV not installed. Please install OpenCV to use this" " model."
-    )
-    raise ImportError
 
 # Load environment variables
 load_dotenv()
@@ -120,7 +112,15 @@ class GPT4VisionAPI(BaseMultiModalModel):
         return base64.b64encode(response.content).decode("utf-8")
 
     # Function to handle vision tasks
-    def run(self, task: str = None, img: str = None, *args, **kwargs):
+    def run(
+        self,
+        task: str = None,
+        img: str = None,
+        multi_imgs: list = None,
+        return_json: bool = False,
+        *args,
+        **kwargs,
+    ):
         """Run the model."""
         try:
             base64_image = self.encode_image(img)
@@ -149,31 +149,26 @@ class GPT4VisionAPI(BaseMultiModalModel):
                     },
                 ],
                 "max_tokens": self.max_tokens,
+                **kwargs,
             }
-            response = requests.post(
-                self.openai_proxy, headers=headers, json=payload
-            )
+            response = requests.post(headers=headers, json=payload)
 
-            out = response.json()
-            if "choices" in out and out["choices"]:
-                content = (
-                    out["choices"][0]
-                    .get("message", {})
-                    .get("content", None)
-                )
-                if self.streaming_enabled:
-                    content = self.stream_response(content)
-                return content
+            # Get the response as a JSON object
+            response_json = response.json()
+
+            # Return the JSON object if return_json is True
+            if return_json is True:
+                print(response_json)
+                return response_json
             else:
-                print("No valid response in 'choices'")
-                return None
+                return response_json
 
         except Exception as error:
-            print(
+            logger.error(
                 f"Error with the request: {error}, make sure you"
                 " double check input types and positions"
             )
-            return None
+            raise error
 
     def video_prompt(self, frames):
         """
@@ -216,92 +211,6 @@ class GPT4VisionAPI(BaseMultiModalModel):
         """
         for chunk in content:
             print(chunk)
-
-    def process_video(self, video: str = None):
-        """
-        Process a video into a list of base64 frames
-
-        Parameters
-        ----------
-        video : str
-            The path to the video file
-
-        Returns
-        -------
-        base64_frames : list
-            A list of base64 frames
-
-        Examples
-        --------
-        >>> from swarms.models import GPT4VisionAPI
-        >>> llm = GPT4VisionAPI()
-        >>> video = "video.mp4"
-        >>> base64_frames = llm.process_video(video)
-
-        """
-        video = cv2.VideoCapture(video)
-
-        base64_frames = []
-        while video.isOpened():
-            success, frame = video.read()
-            if not success:
-                break
-            _, buffer = cv2.imencode(".jpg", frame)
-            base64_frames.append(base64.b64encode(buffer).decode("utf-8"))
-
-        video.release()
-        print(len(base64_frames), "frames read.")
-        return base64_frames
-
-    def run_with_video(
-        self,
-        task: str = None,
-        video: str = None,
-        *args,
-        **kwargs,
-    ):
-        prompt = self.video_prompt(self.process_video(video))
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {openai_api_key}",
-        }
-        payload = {
-            "model": self.model_name,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": [self.system_prompt],
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        (task,),  # task
-                        *map(
-                            lambda x: {"image": x, "resize": 768},
-                            prompt[0::50],
-                        ),
-                    ],
-                },
-            ],
-            "max_tokens": self.max_tokens,
-        }
-        response = requests.post(
-            self.openai_proxy,
-            headers=headers,
-            json=payload,
-        )
-
-        out = response.json()
-        content = out["choices"][0]["message"]["content"]
-
-        if self.streaming_enabled:
-            content = self.stream_response(content)
-
-        if self.beautify:
-            content = colored(content, "cyan")
-            print(content)
-        else:
-            print(content)
 
     def __call__(
         self,

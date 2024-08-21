@@ -1,7 +1,5 @@
 from swarms.agents.agent_wrapper import agent_wrapper
 from swarms.agents.base import AbstractAgent
-from swarms.agents.omni_modal_agent import OmniModalAgent
-from swarms.agents.simple_agent import SimpleAgent
 from swarms.agents.stopping_conditions import (
     check_cancelled,
     check_complete,
@@ -15,13 +13,10 @@ from swarms.agents.stopping_conditions import (
     check_success,
 )
 from swarms.agents.tool_agent import ToolAgent
-from swarms.agents.worker_agent import Worker
 
 __all__ = [
     "AbstractAgent",
     "ToolAgent",
-    "SimpleAgent",
-    "OmniModalAgent",
     "check_done",
     "check_finished",
     "check_complete",
@@ -32,6 +27,5 @@ __all__ = [
     "check_cancelled",
     "check_exit",
     "check_end",
-    "Worker",
     "agent_wrapper",
 ]

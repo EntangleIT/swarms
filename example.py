@@ -1,32 +1,36 @@
-from swarms import Agent, Anthropic
+import os
+from swarms import Agent, OpenAIChat
+from swarms.prompts.finance_agent_sys_prompt import (
+    FINANCIAL_AGENT_SYS_PROMPT,
+)
 
+# Get the OpenAI API key from the environment variable
+api_key = os.getenv("OPENAI_API_KEY")
 
-# Initialize the agemt
+# Create an instance of the OpenAIChat class
+model = OpenAIChat(
+    api_key=api_key, model_name="gpt-4o-mini", temperature=0.1
+)
+
+# Initialize the agent
 agent = Agent(
-    agent_name="Transcript Generator",
-    agent_description=(
-        "Generate a transcript for a youtube video on what swarms" " are!"
-    ),
-    llm=Anthropic(),
-    max_loops=3,
+    agent_name="Financial-Analysis-Agent_sas_chicken_eej",
+    system_prompt=FINANCIAL_AGENT_SYS_PROMPT,
+    llm=model,
+    max_loops=1,
     autosave=True,
     dashboard=False,
-    streaming_on=True,
     verbose=True,
-    stopping_token="<DONE>",
-    interactive=True,
-    state_save_file_type="json",
-    saved_state_path="transcript_generator.json",
+    dynamic_temperature_enabled=True,
+    saved_state_path="finance_agent.json",
+    user_name="swarms_corp",
+    retry_attempts=1,
+    context_length=200000,
+    return_step_meta=False,
 )
 
-# Run the Agent on a task
+
 out = agent.run(
-    "Generate a transcript for a youtube video on what swarms are!"
+    "How can I establish a ROTH IRA to buy stocks and get a tax break? What are the criteria"
 )
 print(out)
-
-# Save the state
-check = agent.save_state(
-    "transcript_generator.json",
-    "Generate a transcript for a youtube video on what swarms are!",
-)

@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
@@ -8,32 +9,49 @@ import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+import toml
 import yaml
 from loguru import logger
 from pydantic import BaseModel
+from swarms_cloud.schema.agent_api_schemas import (
+    AgentChatCompletionResponse,
+)
+from swarms_cloud.schema.cog_vlm_schemas import (
+    ChatCompletionResponseChoice,
+    ChatMessageResponse,
+    UsageInfo,
+)
 from termcolor import colored
 
 from swarms.memory.base_vectordb import BaseVectorDatabase
+from swarms.models.tiktoken_wrapper import TikTokenizer
 from swarms.prompts.agent_system_prompts import AGENT_SYSTEM_PROMPT_3
+from swarms.prompts.aot_prompt import algorithm_of_thoughts_sop
 from swarms.prompts.multi_modal_autonomous_instruction_prompt import (
     MULTI_MODAL_AUTO_AGENT_SYSTEM_PROMPT_1,
 )
-from swarms.prompts.worker_prompt import tool_usage_worker_prompt
+from swarms.prompts.tools import tool_sop_prompt
+from swarms.schemas.schemas import ManySteps, Step
 from swarms.structs.conversation import Conversation
-from swarms.structs.schemas import ManySteps, Step
-from swarms.structs.yaml_model import YamlModel
-from swarms.telemetry.user_utils import get_user_device_data
-from swarms.tools.code_interpreter import SubprocessCodeInterpreter
-from swarms.tools.exec_tool import execute_tool_by_name
+from swarms.tools.func_calling_utils import (
+    prepare_output_for_output_model,
+    pydantic_model_to_json_str,
+)
+from swarms.tools.prebuilt.code_executor import CodeExecutor
+from swarms.tools.prebuilt.code_interpreter import (
+    SubprocessCodeInterpreter,
+)
+from swarms.tools.py_func_to_openai_func_str import (
+    get_openai_function_schema_from_func,
+)
 from swarms.tools.pydantic_to_json import (
-    base_model_to_openai_function,
     multi_base_model_to_openai_function,
 )
-from swarms.tools.tool import BaseTool
+from swarms.tools.tool_parse_exec import parse_and_execute_json
 from swarms.utils.data_to_text import data_to_text
+from swarms.utils.file_processing import create_file_in_folder
 from swarms.utils.parse_code import extract_code_from_markdown
 from swarms.utils.pdf_to_text import pdf_to_text
-from swarms.prompts.aot_prompt import algorithm_of_thoughts_sop
 
 
 # Utils
@@ -52,23 +70,11 @@ def parse_done_token(response: str) -> bool:
 # Agent ID generator
 def agent_id():
     """Generate an agent id"""
-    return str(uuid.uuid4())
+    return uuid.uuid4().hex
 
 
-# Task ID generator
-def task_id():
-    """
-    Generate a unique task ID.
-
-    Returns:
-        str: A string representation of a UUID.
-    """
-    return str(uuid.uuid4())
-
-
-# Step ID generator
-def step_id():
-    return str(uuid.uuid1())
+def exists(val):
+    return val is not None
 
 
 # Agent output types
@@ -167,7 +173,8 @@ class Agent:
 
     def __init__(
         self,
-        id: Optional[str] = agent_id,
+        agent_id: Optional[str] = agent_id(),
+        id: Optional[str] = agent_id(),
         llm: Optional[Any] = None,
         template: Optional[str] = None,
         max_loops: Optional[int] = 1,
@@ -183,7 +190,8 @@ class Agent:
         agent_name: Optional[str] = "swarm-worker-01",
         agent_description: Optional[str] = None,
         system_prompt: Optional[str] = AGENT_SYSTEM_PROMPT_3,
-        tools: List[BaseTool] = [],
+        # TODO: Change to callable, then parse the callable to a string
+        tools: List[Callable] = None,
         dynamic_temperature_enabled: Optional[bool] = False,
         sop: Optional[str] = None,
         sop_list: Optional[List[str]] = None,
@@ -196,7 +204,7 @@ class Agent:
         multi_modal: Optional[bool] = None,
         pdf_path: Optional[str] = None,
         list_of_pdf: Optional[str] = None,
-        tokenizer: Optional[Any] = None,
+        tokenizer: Optional[Any] = TikTokenizer(),
         long_term_memory: Optional[BaseVectorDatabase] = None,
         preset_stopping_token: Optional[bool] = False,
         traceback: Optional[Any] = None,
@@ -213,30 +221,58 @@ class Agent:
         logger_handler: Optional[Any] = sys.stderr,
         search_algorithm: Optional[Callable] = None,
         logs_to_filename: Optional[str] = None,
-        evaluator: Optional[Callable] = None,
+        evaluator: Optional[Callable] = None,  # Custom LLM or agent
         output_json: Optional[bool] = False,
         stopping_func: Optional[Callable] = None,
         custom_loop_condition: Optional[Callable] = None,
-        sentiment_threshold: Optional[float] = None,
+        sentiment_threshold: Optional[
+            float
+        ] = None,  # Evaluate on output using an external model
         custom_exit_command: Optional[str] = "exit",
         sentiment_analyzer: Optional[Callable] = None,
         limit_tokens_from_string: Optional[Callable] = None,
+        # [Tools]
         custom_tools_prompt: Optional[Callable] = None,
         tool_schema: ToolUsageType = None,
         output_type: agent_output_type = None,
         function_calling_type: str = "json",
         output_cleaner: Optional[Callable] = None,
         function_calling_format_type: Optional[str] = "OpenAI",
-        list_tool_schemas: Optional[List[BaseModel]] = None,
+        list_base_models: Optional[List[BaseModel]] = None,
         metadata_output_type: str = "json",
         state_save_file_type: str = "json",
         chain_of_thoughts: bool = False,
         algorithm_of_thoughts: bool = False,
         tree_of_thoughts: bool = False,
         tool_choice: str = "auto",
+        execute_tool: bool = False,
+        rules: str = None,
+        planning: Optional[str] = False,
+        planning_prompt: Optional[str] = None,
+        device: str = None,
+        custom_planning_prompt: str = None,
+        memory_chunk_size: int = 2000,
+        agent_ops_on: bool = False,
+        log_directory: str = None,
+        tool_system_prompt: str = tool_sop_prompt(),
+        max_tokens: int = 4096,
+        top_p: float = 0.9,
+        top_k: int = None,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        temperature: float = 0.1,
+        workspace_dir: str = "agent_workspace",
+        timeout: Optional[int] = None,
+        # short_memory: Optional[str] = None,
+        created_at: float = time.time(),
+        return_step_meta: Optional[bool] = False,
+        tags: Optional[List[str]] = None,
+        use_cases: Optional[List[Dict[str, str]]] = None,
         *args,
         **kwargs,
     ):
+        # super().__init__(*args, **kwargs)
+        self.agent_id = agent_id
         self.id = id
         self.llm = llm
         self.template = template
@@ -260,7 +296,6 @@ class Agent:
         self.system_prompt = system_prompt
         self.agent_name = agent_name
         self.agent_description = agent_description
-        self.saved_state_path = saved_state_path
         self.saved_state_path = f"{self.agent_name}_state.json"
         self.autosave = autosave
         self.response_filters = []
@@ -299,94 +334,109 @@ class Agent:
         self.function_calling_type = function_calling_type
         self.output_cleaner = output_cleaner
         self.function_calling_format_type = function_calling_format_type
-        self.list_tool_schemas = list_tool_schemas
+        self.list_base_models = list_base_models
         self.metadata_output_type = metadata_output_type
         self.state_save_file_type = state_save_file_type
         self.chain_of_thoughts = chain_of_thoughts
         self.algorithm_of_thoughts = algorithm_of_thoughts
         self.tree_of_thoughts = tree_of_thoughts
         self.tool_choice = tool_choice
+        self.execute_tool = execute_tool
+        self.planning = planning
+        self.planning_prompt = planning_prompt
+        self.device = device
+        self.custom_planning_prompt = custom_planning_prompt
+        self.rules = rules
+        self.custom_tools_prompt = custom_tools_prompt
+        self.memory_chunk_size = memory_chunk_size
+        self.agent_ops_on = agent_ops_on
+        self.log_directory = log_directory
+        self.tool_system_prompt = tool_system_prompt
+        self.max_tokens = max_tokens
+        self.top_p = top_p
+        self.top_k = top_k
+        self.frequency_penalty = frequency_penalty
+        self.presence_penalty = presence_penalty
+        self.temperature = temperature
+        self.workspace_dir = workspace_dir
+        self.timeout = timeout
+        self.created_at = created_at
+        self.return_step_meta = return_step_meta
+        self.tags = tags
+        self.use_cases = use_cases
 
-        # The max_loops will be set dynamically if the dynamic_loop
-        if self.dynamic_loops:
-            logger.info("Dynamic loops enabled")
-            self.max_loops = "auto"
-
-        # If multimodal = yes then set the sop to the multimodal sop
-        if self.multi_modal:
-            self.sop = MULTI_MODAL_AUTO_AGENT_SYSTEM_PROMPT_1
-
-        # If the user inputs a list of strings for the sop then join them and set the sop
-        if self.sop_list:
-            self.sop = "\n".join(self.sop_list)
-
-        # Memory
-        self.feedback = []
-
-        # Initialize the code executor
-        self.code_executor = SubprocessCodeInterpreter(
-            debug_mode=True,
-        )
-
-        # If the preset stopping token is enabled then set the stopping token to the preset stopping token
-        if preset_stopping_token is not None:
-            self.stopping_token = "<DONE>"
-
-        # If the stopping function is provided then set the stopping condition to the stopping function
-        self.short_memory = Conversation(
-            system_prompt=system_prompt, time_enabled=True, *args, **kwargs
-        )
-
-        # If the docs exist then ingest the docs
-        if self.docs:
-            self.ingest_docs(self.docs)
-
-        # If docs folder exists then get the docs from docs folder
-        if self.docs_folder:
-            self.get_docs_from_doc_folders()
-
-        # If tokenizer and context length exists then:
-        # if self.tokenizer and self.context_length:
-        #     self.truncate_history()
-
-        # If verbose is enabled then set the logger level to info
-        # if verbose:
-        #     logger.setLevel(logging.INFO)
-
-        # If tools are provided then set the tool prompt by adding to sop
-        if self.tools:
-            if custom_tools_prompt is not None:
-                tools_prompt = custom_tools_prompt(tools=self.tools)
-
-                self.short_memory.add(
-                    role=self.agent_name, content=tools_prompt
-                )
-
-            else:
-                tools_prompt = tool_usage_worker_prompt(tools=self.tools)
-
-                # Append the tools prompt to the short_term_memory
-                self.short_memory.add(
-                    role=self.agent_name, content=tools_prompt
-                )
-
-        # If the long term memory is provided then set the long term memory prompt
+        # Name
+        self.name = agent_name
+        self.description = agent_description
 
         # Agentic stuff
         self.reply = ""
         self.question = None
         self.answer = ""
 
-        # Initialize the llm with the conditional variables
-        # self.llm = llm(*args, **kwargs)
+        # The max_loops will be set dynamically if the dynamic_loop
+        if self.dynamic_loops is True:
+            logger.info("Dynamic loops enabled")
+            self.max_loops = "auto"
 
-        # Step cache
-        self.step_cache = []
+        # If multimodal = yes then set the sop to the multimodal sop
+        if self.multi_modal is True:
+            self.sop = MULTI_MODAL_AUTO_AGENT_SYSTEM_PROMPT_1
+
+        # Memory
+        self.feedback = []
+
+        # If the preset stopping token is enabled then set the stopping token to the preset stopping token
+        if preset_stopping_token is not None:
+            self.stopping_token = "<DONE>"
+
+        # If the system prompt is provided then set the system prompt
+        # Initialize the short term memory
+        self.short_memory = Conversation(
+            system_prompt=system_prompt,
+            time_enabled=True,
+            user=user_name,
+            rules=rules,
+            *args,
+            **kwargs,
+        )
+
+        # Check the parameters
+        self.agent_initialization()
+
+        # If the docs exist then ingest the docs
+        if exists(self.docs):
+            self.ingest_docs(self.docs)
+
+        # If docs folder exists then get the docs from docs folder
+        if exists(self.docs_folder):
+            self.get_docs_from_doc_folders()
+
+        if tools is not None:
+            logger.info(
+                "Tools provided make sure the functions have documentation ++ type hints, otherwise tool execution won't be reliable."
+            )
+            # Add the tool prompt to the memory
+            self.short_memory.add(
+                role="system", content=tool_system_prompt
+            )
+
+            # Log the tools
+            logger.info(f"Tools provided: Accessing {len(tools)} tools")
+
+            # Transform the tools into an openai schema
+            self.convert_tool_into_openai_schema()
+
+            # Now create a function calling map for every tools
+            self.function_map = {tool.__name__: tool for tool in tools}
 
         # Set the logger handler
-        if logger_handler:
+        if exists(logger_handler):
+            log_file_path = os.path.join(
+                self.workspace_dir, f"{self.agent_name}.log"
+            )
             logger.add(
-                f"{self.agent_name}.log",
+                log_file_path,
                 level="INFO",
                 colorize=True,
                 format=("<green>{time}</green> <level>{message}</level>"),
@@ -394,44 +444,69 @@ class Agent:
                 diagnose=True,
             )
 
-        # logger.info("Creating Agent {}".format(self.agent_name))
-
-        # If the tool types
+        # If the tool types are provided
         if self.tool_schema is not None:
-            logger.info("Tool schema provided")
-            tool_schema_str = self.tool_schema_to_str(self.tool_schema)
-
-            print(tool_schema_str)
-
-            # Add to the short memory
-            logger.info(f"Adding tool schema to memory: {tool_schema_str}")
+            # Log the tool schema
+            logger.info(
+                "Tool schema provided, Automatically converting to OpenAI function"
+            )
+            tool_schema_str = pydantic_model_to_json_str(
+                self.tool_schema, indent=4
+            )
+            logger.info(f"Tool Schema: {tool_schema_str}")
+            # Add the tool schema to the short memory
             self.short_memory.add(
                 role=self.user_name, content=tool_schema_str
             )
 
-        # If a list of tool schemas:
-        if self.list_tool_schemas is not None:
-            logger.info("Tool schema provided")
-            tool_schema_str = self.tool_schemas_to_str(list_tool_schemas)
+        # If multiple base models, then conver them.
+        if self.list_base_models is not None:
 
-            # Add to the short memory
-            logger.info(f"Adding tool schema to memory: {tool_schema_str}")
-            self.short_memory.add(
-                role=self.user_name, content=tool_schema_str
-            )
-
-        # Name
-        self.name = agent_name
-
-        # Description
-        self.description = agent_description
+            self.handle_multiple_base_models()
 
         # If the algorithm of thoughts is enabled then set the sop to the algorithm of thoughts
-        if self.algorithm_of_thoughts is not None:
+        if self.algorithm_of_thoughts is not False:
             self.short_memory.add(
                 role=self.agent_name,
                 content=algorithm_of_thoughts_sop(objective=self.task),
             )
+
+        # Return the history
+        if return_history is True:
+            logger.info(f"Beginning of Agent {self.agent_name} History")
+            logger.info(self.short_memory.return_history_as_string())
+            logger.info(f"End of Agent {self.agent_name} History")
+
+        # If the user inputs a list of strings for the sop then join them and set the sop
+        if exists(self.sop_list):
+            self.sop = "\n".join(self.sop_list)
+            self.short_memory.add(role=self.user_name, content=self.sop)
+
+        if exists(self.sop):
+            self.short_memory.add(role=self.user_name, content=self.sop)
+
+        # If agent_ops is on => activate agentops
+        if agent_ops_on is True:
+            self.activate_agentops()
+
+        # Code Executor
+        if code_interpreter is True:
+            self.code_executor = CodeExecutor(
+                max_output_length=1000,
+                artifacts_directory=self.workspace_dir,
+            )
+
+        # Telemetry Processor
+        # self.setup_telemetry_capture()
+
+    # Todo: Implement the function
+    # def setup_telemetry_capture(self):
+    #     self.telemetry_capturer = TelemetryProcessor()
+    #     json_data = self.telemetry_capturer.process_data(self.to_dict())
+    #     self.telemetry_capturer.export_to_server(
+    #         json_data, api_url="https://swarms.world/v1/log-agent"
+    #     )
+    #     return None
 
     def set_system_prompt(self, system_prompt: str):
         """Set the system prompt"""
@@ -441,6 +516,38 @@ class Agent:
         """Allow users to provide feedback on the responses."""
         self.feedback.append(feedback)
         logging.info(f"Feedback received: {feedback}")
+
+    # TODO: Implement the function
+    # def initialize_llm(self, llm: Any) -> None:
+    #     return llm(
+    #         system_prompt=self.system_prompt,
+    #         max_tokens=self.max_tokens,
+    #         context_length=self.context_length,
+    #         temperature=self.temperature,
+    #         top_p=self.top_p,
+    #         top_k=self.top_k,
+    #         frequency_penalty=self.frequency_penalty,
+    #         presence_penalty=self.presence_penalty,
+    #         stop=self.stopping_token,
+    #     )
+
+    def agent_initialization(self):
+        try:
+            logger.info(
+                f"Initializing Autonomous Agent {self.agent_name}..."
+            )
+            self.check_parameters()
+            logger.info("Agent Initialized Successfully.")
+            logger.info(
+                f"Autonomous Agent {self.agent_name} Activated, all systems operational. Executing task..."
+            )
+
+            if self.dashboard is True:
+                self.print_dashboard()
+
+        except ValueError as e:
+            logger.info(f"Error initializing agent: {e}")
+            raise e
 
     def _check_stopping_condition(self, response: str) -> bool:
         """Check if the stopping condition is met."""
@@ -480,74 +587,32 @@ class Agent:
         """Format the template with the provided kwargs using f-string interpolation."""
         return template.format(**kwargs)
 
-    def add_task_to_memory(self, task: str):
-        """Add the task to the memory"""
-        try:
-            logger.info(f"Adding task to memory: {task}")
-            self.short_memory.add(f"{self.user_name}: {task}")
-        except Exception as error:
-            print(colored(f"Error adding task to memory: {error}", "red"))
-
-    # ############## TOKENIZER FUNCTIONS ##############
-    def count_tokens(self, text: str) -> int:
-        """Count the number of tokens in the text."""
-        return self.tokenizer.len(text)
-
-    def tokens_per_second(self, text: str) -> float:
-        """
-        Calculates the number of tokens processed per second.
-
-        Args:
-            text (str): The input text to count tokens from.
-
-        Returns:
-            float: The number of tokens processed per second.
-        """
-        import time
-
-        start_time = time.time()
-        tokens = self.count_tokens(text)
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        return tokens / elapsed_time
-
-    def time_to_generate(self, text: str) -> float:
-        """
-        Calculates the time taken to generate the output.
-
-        Args:
-            text (str): The input text to generate output from.
-
-        Returns:
-            float: The time taken to generate the output.
-        """
-        import time
-
-        start_time = time.time()
-        self.llm(text)
-        end_time = time.time()
-        return end_time - start_time
-
-    # ############## TOKENIZER FUNCTIONS ##############
-
-    def add_message_to_memory(self, message: str):
+    def add_message_to_memory(self, message: str, *args, **kwargs):
         """Add the message to the memory"""
         try:
             logger.info(f"Adding message to memory: {message}")
-            self.short_memory.add(role=self.agent_name, content=message)
+            self.short_memory.add(
+                role=self.agent_name, content=message, *args, **kwargs
+            )
         except Exception as error:
             print(
                 colored(f"Error adding message to memory: {error}", "red")
             )
 
-    def add_message_to_memory_and_truncate(self, message: str):
-        """Add the message to the memory and truncate"""
-        self.short_memory[-1].append(message)
-        self.truncate_history()
+    # def add_message_to_memory_and_truncate(self, message: str):
+    #     """Add the message to the memory and truncate"""
+    #     self.short_memory[-1].append(message)
+    #     self.truncate_history()
 
-    def print_dashboard(self, task: str):
+    def print_dashboard(self):
         """Print dashboard"""
         print(colored("Initializing Agent Dashboard...", "yellow"))
+
+        data = self.to_dict()
+
+        # Beautify the data
+        # data = json.dumps(data, indent=4)
+        # json_data = json.dumps(data, indent=4)
 
         print(
             colored(
@@ -555,69 +620,17 @@ class Agent:
                 Agent Dashboard
                 --------------------------------------------
 
-                Agent loop is initializing for {self.max_loops} with the following configuration:
+                Agent {self.agent_name} is initializing for {self.max_loops} with the following configuration:
                 ----------------------------------------
 
                 Agent Configuration:
-                    Agent ID: {self.id}
-                    Name: {self.agent_name}
-                    Description: {self.agent_description}
-                    Standard Operating Procedure: {self.sop}
-                    System Prompt: {self.system_prompt} 
-                    Task: {task}
-                    Max Loops: {self.max_loops}
-                    Stopping Condition: {self.stopping_condition}
-                    Loop Interval: {self.loop_interval}
-                    Retry Attempts: {self.retry_attempts}
-                    Retry Interval: {self.retry_interval}
-                    Interactive: {self.interactive}
-                    Dashboard: {self.dashboard}
-                    Dynamic Temperature: {self.dynamic_temperature_enabled}
-                    Autosave: {self.autosave}
-                    Saved State: {self.saved_state_path}
+                    Configuration: {data}
 
                 ----------------------------------------
                 """,
                 "green",
             )
         )
-
-    def activate_autonomous_agent(self):
-        """Print the autonomous agent activation message"""
-        try:
-            print(
-                colored(
-                    (
-                        "Initializing Autonomous Agent"
-                        f" {self.agent_name}..."
-                    ),
-                    "yellow",
-                )
-            )
-            print(
-                colored(
-                    "Autonomous Agent Activated.",
-                    "cyan",
-                    attrs=["bold"],
-                )
-            )
-            print(
-                colored(
-                    "All systems operational. Executing task...",
-                    "green",
-                )
-            )
-        except Exception as error:
-            print(
-                colored(
-                    (
-                        "Error activating autonomous agent. Try"
-                        " optimizing your parameters..."
-                    ),
-                    "red",
-                )
-            )
-            print(error)
 
     def loop_count_print(self, loop_count, max_loops):
         """loop_count_print summary
@@ -629,199 +642,131 @@ class Agent:
         print(colored(f"\nLoop {loop_count} of {max_loops}", "cyan"))
         print("\n")
 
-    def streaming(self, content: str = None):
-        """prints each chunk of content as it is generated
+    def check_parameters(self):
+        if self.llm is None:
+            raise ValueError("Language model is not provided")
 
-        Args:
-            content (str, optional): _description_. Defaults to None.
-        """
-        for chunk in content:
-            print(chunk, end="")
+        if self.max_loops is None:
+            raise ValueError("Max loops is not provided")
 
-    ########################## FUNCTION CALLING ##########################
+        if self.max_tokens == 0:
+            raise ValueError("Max tokens is not provided")
 
-    def json_str_to_json(self, json_str: str):
-        """Convert a JSON string to a JSON object"""
-        return json.loads(json_str)
-
-    def json_str_to_pydantic_model(self, json_str: str, model: BaseModel):
-        """Convert a JSON string to a Pydantic model"""
-        return model.model_validate_json(json_str)
-
-    def json_str_to_dict(self, json_str: str):
-        """Convert a JSON string to a dictionary"""
-        return json.loads(json_str)
-
-    def pydantic_model_to_json_str(self, model: BaseModel):
-        return str(base_model_to_openai_function(model))
-
-    def dict_to_json_str(self, dictionary: dict):
-        """Convert a dictionary to a JSON string"""
-        return json.dumps(dictionary)
-
-    def dict_to_pydantic_model(self, dictionary: dict, model: BaseModel):
-        """Convert a dictionary to a Pydantic model"""
-        return model.model_validate_json(dictionary)
-
-    # def prep_pydantic_model_for_str(self, model: BaseModel):
-    #     # Convert to Function
-    #     out = self.pydantic_model_to_json_str(model)
-
-    #     # return function_to_str(out)
-
-    def tool_schema_to_str(
-        self, tool_schema: BaseModel = None, *args, **kwargs
-    ):
-        """Convert a tool schema to a string"""
-        out = base_model_to_openai_function(tool_schema)
-        return str(out)
-
-    def tool_schemas_to_str(
-        self, tool_schemas: List[BaseModel] = None, *args, **kwargs
-    ):
-        """Convert a list of tool schemas to a string"""
-        out = multi_base_model_to_openai_function(tool_schemas)
-        return str(out)
-
-    def str_to_pydantic_model(self, string: str, model: BaseModel):
-        """Convert a string to a Pydantic model"""
-        return model.model_validate_json(string)
-
-    def list_str_to_pydantic_model(
-        self, list_str: List[str], model: BaseModel
-    ):
-        """Convert a list of strings to a Pydantic model"""
-        # return model.model_validate_json(list_str)
-        for string in list_str:
-            return model.model_validate_json(string)
-
-    def prepare_output_for_output_model(
-        self, output: agent_output_type = None
-    ):
-        """Prepare the output for the output model"""
-        if self.output_type == BaseModel:
-            return self.str_to_pydantic_model(output, self.output_type)
-        elif self.output_type == dict:
-            return self.dict_to_json_str(output)
-        elif self.output_type == str:
-            return output
-        else:
-            return output
+        if self.context_length == 0:
+            raise ValueError("Context length is not provided")
 
     ########################## FUNCTION CALLING ##########################
-
-    def _history(self, user_name: str, task: str) -> str:
-        """Generate the history for the history prompt
-
-        Args:
-            user_name (str): _description_
-            task (str): _description_
-
-        Returns:
-            str: _description_
-        """
-        history = [f"{user_name}: {task}"]
-        return history
-
-    def _dynamic_prompt_setup(self, dynamic_prompt: str, task: str) -> str:
-        """_dynamic_prompt_setup summary
-
-        Args:
-            dynamic_prompt (str): _description_
-            task (str): _description_
-
-        Returns:
-            str: _description_
-        """
-        dynamic_prompt = dynamic_prompt or self.construct_dynamic_prompt()
-        combined_prompt = f"{dynamic_prompt}\n{task}"
-        return combined_prompt
 
     def run(
         self,
         task: Optional[str] = None,
         img: Optional[str] = None,
+        video: Optional[str] = None,
+        is_last: bool = False,
         *args,
         **kwargs,
-    ):
+    ) -> Any:
         """
         Run the autonomous agent loop
         """
         try:
-            self.activate_autonomous_agent()
+            # self.agent_initialization()
 
-            if task:
-                self.short_memory.add(role=self.user_name, content=task)
+            # Add task to memory
+            self.short_memory.add(role=self.user_name, content=task)
 
+            # Set the loop count
             loop_count = 0
-            response = None
-            step_pool = []
 
-            while (
-                self.max_loops == "auto"
-                or loop_count < self.max_loops
-                # or self.custom_loop_condition()
-            ):
+            # Clear the short memory
+            response = None
+            all_responses = []
+            steps_pool = []
+
+            # if self.tokenizer is not None:
+            #     self.check_available_tokens()
+
+            while self.max_loops == "auto" or loop_count < self.max_loops:
                 loop_count += 1
                 self.loop_count_print(loop_count, self.max_loops)
                 print("\n")
 
-                if self.dynamic_temperature_enabled:
+                # Dynamic temperature
+                if self.dynamic_temperature_enabled is True:
                     self.dynamic_temperature()
 
+                # Task prompt
                 task_prompt = self.short_memory.return_history_as_string()
 
+                # Parameters
                 attempt = 0
                 success = False
                 while attempt < self.retry_attempts and not success:
                     try:
-                        response_args = (
-                            (task_prompt, *args)
-                            if img is None
-                            else (task_prompt, img, *args)
-                        )
-                        response = self.llm(*response_args, **kwargs)
-                        # print(response)
-                        self.short_memory.add(
-                            role=self.agent_name, content=response
-                        )
+                        if self.long_term_memory is not None:
+                            logger.info("Querying long term memory...")
+                            self.memory_query(task_prompt)
 
-                        if self.tools:
-                            # Extract code from markdown
-                            response = extract_code_from_markdown(response)
-
-                            # Execute the tool by name
-                            execute_tool_by_name(
-                                response,
-                                self.tools,
-                                stop_token=self.stopping_token,
+                        else:
+                            response_args = (
+                                (task_prompt, *args)
+                                if img is None
+                                else (task_prompt, img, *args)
                             )
+                            response = self.llm(*response_args, **kwargs)
 
-                        if self.code_interpreter:
-                            # Extract code from markdown
-                            extracted_code = extract_code_from_markdown(
-                                response
-                            )
+                            # Conver to a str if the response is not a str
+                            response = self.llm_output_parser(response)
 
-                            # Execute the code
-                            execution = SubprocessCodeInterpreter(
-                                debug_mode=True
-                            ).run(extracted_code)
+                            # Print
+                            if self.streaming_on is True:
+                                response = self.stream_response(response)
+                            else:
+                                print(response)
 
-                            # Add the execution to the memory
+                            # Add the response to the memory
                             self.short_memory.add(
-                                role=self.agent_name,
-                                content=execution,
+                                role=self.agent_name, content=response
                             )
 
-                            # Run the llm again
+                            # Add to all responses
+                            all_responses.append(response)
+
+                            # Log the step
+                            if self.return_step_meta is True:
+                                out_step = self.log_step_metadata(response)
+                                steps_pool.append(out_step)
+
+                        # TODO: Implement reliablity check
+                        if self.tools is not None:
+                            # self.parse_function_call_and_execute(response)
+                            self.parse_and_execute_tools(response)
+
+                        if self.code_interpreter is True:
+                            # Parse the code and execute
+                            logger.info("Parsing code and executing...")
+                            code = extract_code_from_markdown(response)
+
+                            output = self.code_executor.execute(code)
+
+                            # Add to memory
+                            self.short_memory.add(
+                                role=self.agent_name, content=output
+                            )
+
+                            # Run the llm on the output
                             response = self.llm(
-                                self.short_memory.return_history_as_string(),
-                                *args,
-                                **kwargs,
+                                self.short_memory.return_history_as_string()
+                            )
+
+                            # Add to all responses
+                            all_responses.append(response)
+                            self.short_memory.add(
+                                role=self.agent_name, content=response
                             )
 
                         if self.evaluator:
+                            logger.info("Evaluating response...")
                             evaluated_response = self.evaluator(response)
                             print(
                                 "Evaluated Response:"
@@ -832,34 +777,14 @@ class Agent:
                                 content=evaluated_response,
                             )
 
+                        # all_responses.append(evaluated_response)
+
                         # Sentiment analysis
                         if self.sentiment_analyzer:
-                            sentiment = self.sentiment_analyzer(response)
-                            print(f"Sentiment: {sentiment}")
+                            logger.info("Analyzing sentiment...")
+                            self.sentiment_analysis_handler(response)
 
-                            if sentiment > self.sentiment_threshold:
-                                print(
-                                    f"Sentiment: {sentiment} is above"
-                                    " threshold:"
-                                    f" {self.sentiment_threshold}"
-                                )
-                            elif sentiment < self.sentiment_threshold:
-                                print(
-                                    f"Sentiment: {sentiment} is below"
-                                    " threshold:"
-                                    f" {self.sentiment_threshold}"
-                                )
-
-                            # print(f"Sentiment: {sentiment}")
-                            self.short_memory.add(
-                                role=self.agent_name,
-                                content=sentiment,
-                            )
-
-                        if self.streaming:
-                            self.streaming(response)
-                        else:
-                            print(response)
+                        # print(response)
 
                         success = True  # Mark as successful to exit the retry loop
 
@@ -877,21 +802,23 @@ class Agent:
                     )
                     break  # Exit the loop if all retry attempts fail
 
-                # Check stopping conditions
-                if self.stopping_token is not None:
-                    if self.stopping_token in response:
-                        break
-                elif (
+                # # Check stopping conditions
+                # if self.stopping_token in response:
+                #     break
+                if (
                     self.stopping_condition is not None
                     and self._check_stopping_condition(response)
                 ):
+                    logger.info("Stopping condition met.")
                     break
                 elif self.stopping_func is not None and self.stopping_func(
                     response
                 ):
+                    logger.info("Stopping function met.")
                     break
 
                 if self.interactive:
+                    logger.info("Interactive mode enabled.")
                     user_input = colored(input("You: "), "red")
 
                     # User-defined exit command
@@ -912,43 +839,57 @@ class Agent:
                     )
                     time.sleep(self.loop_interval)
 
-                # Save Step Metadata
-                active_step = Step(
-                    task_id=task_id(),
-                    step_id=loop_count,
-                    name=task,
-                    output=response,
-                    max_loops=self.max_loops,
-                )
-
-                step_pool.append(active_step)
-
-                # Save the step pool
-                # self.step_cache = step_pool
-
-            if self.autosave:
+            if self.autosave is True:
                 logger.info("Autosaving agent state.")
-                self.save_state(self.saved_state_path, task)
+                self.save_state(self.saved_state_path)
 
             # Apply the cleaner function to the response
             if self.output_cleaner is not None:
+                logger.info("Applying output cleaner to response.")
                 response = self.output_cleaner(response)
+                logger.info(f"Response after output cleaner: {response}")
 
-            # Prepare the output for the output model
-            if self.output_type is not None:
-                response = self.prepare_output_for_output_model(response)
+            # print(response)
+            if self.agent_ops_on is True and is_last is True:
+                self.check_end_session_agentops()
 
-            # List of steps for this task
-            ManySteps(task_id=task_id(), steps=step_pool)
+            # final_response = " ".join(all_responses)
+            all_responses = [
+                response
+                for response in all_responses
+                if response is not None
+            ]
+            final_response = " ".join(all_responses)
 
-            # Save Many steps
+            # logger.info(f"Final Response: {final_response}")
+            if self.return_history:
+                return self.short_memory.return_history_as_string()
 
-            return response
+            elif self.return_step_meta:
+                log = ManySteps(
+                    agent_id=self.agent_id,
+                    agent_name=self.agent_name,
+                    task=task,
+                    number_of_steps=self.max_loops,
+                    steps=steps_pool,
+                    full_history=self.short_memory.return_history_as_string(),
+                    total_tokens=self.tokenizer.count_tokens(
+                        self.short_memory.return_history_as_string()
+                    ),
+                )
+
+                return log.model_dump_json(indent=4)
+
+            else:
+                return final_response
+
         except Exception as error:
-            print(f"Error running agent: {error}")
+            logger.info(
+                f"Error running agent: {error} optimize your input parameters"
+            )
             raise error
 
-    def __call__(self, task: str, img: str = None, *args, **kwargs):
+    def __call__(self, task: str = None, img: str = None, *args, **kwargs):
         """Call the agent
 
         Args:
@@ -956,63 +897,78 @@ class Agent:
             img (str, optional): _description_. Defaults to None.
         """
         try:
-            self.run(task, img, *args, **kwargs)
+            return self.run(task, img, *args, **kwargs)
         except Exception as error:
             logger.error(f"Error calling agent: {error}")
-            raise
+            raise error
 
-    def agent_history_prompt(
-        self,
-        history: str = None,
-    ):
-        """
-        Generate the agent history prompt
+    def parse_and_execute_tools(self, response: str, *args, **kwargs):
+        # Extract json from markdown
+        # response = extract_code_from_markdown(response)
 
-        Args:
-            system_prompt (str): The system prompt
-            history (List[str]): The history of the conversation
+        # Try executing the tool
+        if self.execute_tool is not False:
+            try:
+                logger.info("Executing tool...")
 
-        Returns:
-            str: The agent history prompt
-        """
-        if self.sop:
-            system_prompt = self.system_prompt
-            agent_history_prompt = f"""
-                role: system
-                {system_prompt}
+                # try to Execute the tool and return a string
+                out = parse_and_execute_json(
+                    self.tools, response, parse_md=True, *args, **kwargs
+                )
 
-                Follow this standard operating procedure (SOP) to complete tasks:
-                {self.sop}
-                
-                {history}
-            """
-            return agent_history_prompt
-        else:
-            system_prompt = self.system_prompt
-            agent_history_prompt = f"""
-                System : {system_prompt}
-                
-                {history}
-            """
-            return agent_history_prompt
+                print(f"Tool Output: {out}")
 
-    def long_term_memory_prompt(self, query: str, *args, **kwargs):
-        """
-        Generate the agent long term memory prompt
+                # Add the output to the memory
+                self.short_memory.add(
+                    role=self.agent_name,
+                    content=out,
+                )
 
-        Args:
-            system_prompt (str): The system prompt
-            history (List[str]): The history of the conversation
+            except Exception as error:
+                logger.error(f"Error executing tool: {error}")
+                print(
+                    colored(
+                        f"Error executing tool: {error}",
+                        "red",
+                    )
+                )
 
-        Returns:
-            str: The agent history prompt
-        """
-        ltr = self.long_term_memory.query(query, *args, **kwargs)
+    # def long_term_memory_prompt(self, query: str, *args, **kwargs):
+    #     """
+    #     Generate the agent long term memory prompt
 
-        context = f"""
-            System: This reminds you of these events from your past: [{ltr}]
-        """
-        return self.short_memory.add(role=self.agent_name, content=context)
+    #     Args:
+    #         system_prompt (str): The system prompt
+    #         history (List[str]): The history of the conversation
+
+    #     Returns:
+    #         str: The agent history prompt
+    #     """
+    #     try:
+    #         logger.info(f"Querying long term memory database for {query}")
+    #         ltr = self.long_term_memory.query(query, *args, **kwargs)
+
+    #         # Count the tokens
+    #         logger.info("Couting tokens of retrieved document")
+    #         ltr_count = self.tokenizer.count_tokens(ltr)
+    #         logger.info(f"Retrieved document token count {ltr_count}")
+
+    #         if ltr_count > self.memory_chunk_size:
+    #             logger.info(
+    #                 f"Truncating memory by {self.memory_chunk_size}"
+    #             )
+    #             out = self.truncate_string_by_tokens(
+    #                 ltr, self.memory_chunk_size
+    #             )
+    #             logger.info(
+    #                 f"Memory truncated by {self.memory_chunk_size}"
+    #             )
+
+    #         # Retrieve only the chunk size of the memory
+    #         return out
+    #     except Exception as error:
+    #         logger.error(f"Error querying long term memory: {error}")
+    #         raise error
 
     def add_memory(self, message: str):
         """Add a memory to the agent
@@ -1026,50 +982,78 @@ class Agent:
         logger.info(f"Adding memory: {message}")
         return self.short_memory.add(role=self.agent_name, content=message)
 
-    async def run_concurrent(self, tasks: List[str], **kwargs):
+    def plan(self, task: str, *args, **kwargs):
         """
-        Run a batch of tasks concurrently and handle an infinite level of task inputs.
+        Plan the task
 
         Args:
-            tasks (List[str]): A list of tasks to run.
+            task (str): The task to plan
         """
         try:
-            logger.info(f"Running concurrent tasks: {tasks}")
-            task_coroutines = [
-                self.run_async(task, **kwargs) for task in tasks
-            ]
-            completed_tasks = await asyncio.gather(*task_coroutines)
-            logger.info(f"Completed tasks: {completed_tasks}")
-            return completed_tasks
+            if exists(self.planning_prompt):
+                # Join the plan and the task
+                planning_prompt = f"{self.planning_prompt} {task}"
+                plan = self.llm(planning_prompt)
+
+            # Add the plan to the memory
+            self.short_memory.add(role=self.agent_name, content=plan)
+
+            return None
         except Exception as error:
-            print(
-                colored(
-                    (
-                        f"Error running agent: {error} while running"
-                        " concurrently"
-                    ),
-                    "red",
-                )
+            logger.error(f"Error planning task: {error}")
+            raise error
+
+    async def run_concurrent(self, task: str, *args, **kwargs):
+        """
+        Run a task concurrently.
+
+        Args:
+            task (str): The task to run.
+        """
+        try:
+            logger.info(f"Running concurrent task: {task}")
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(self.run, task, *args, **kwargs)
+                result = await asyncio.wrap_future(future)
+                logger.info(f"Completed task: {result}")
+                return result
+        except Exception as error:
+            logger.error(
+                f"Error running agent: {error} while running concurrently"
             )
 
     def bulk_run(self, inputs: List[Dict[str, Any]]) -> List[str]:
+        """
+        Generate responses for multiple input sets.
+
+        Args:
+            inputs (List[Dict[str, Any]]): A list of input dictionaries containing the necessary data for each run.
+
+        Returns:
+            List[str]: A list of response strings generated for each input set.
+
+        Raises:
+            Exception: If an error occurs while running the bulk tasks.
+        """
         try:
-            """Generate responses for multiple input sets."""
             logger.info(f"Running bulk tasks: {inputs}")
             return [self.run(**input_data) for input_data in inputs]
         except Exception as error:
             print(colored(f"Error running bulk run: {error}", "red"))
 
-    def save(self, file_path) -> None:
+    def save(self) -> None:
         """Save the agent history to a file.
 
         Args:
             file_path (_type_): _description_
         """
         try:
-            with open(file_path, "w") as f:
-                json.dump(self.short_memory, f)
-            # print(f"Saved agent history to {file_path}")
+            create_file_in_folder(
+                self.workspace_dir,
+                f"{self.saved_state_path}",
+                self.to_dict(),
+            )
+            return "Saved agent history"
         except Exception as error:
             print(colored(f"Error saving agent history: {error}", "red"))
 
@@ -1080,43 +1064,15 @@ class Agent:
         Args:
             file_path (str): The path to the file containing the saved agent history.
         """
-        with open(file_path) as f:
-            self.short_memory = json.load(f)
-        print(f"Loaded agent history from {file_path}")
+        with open(file_path, "r") as file:
+            data = json.load(file)
 
-    def validate_response(self, response: str) -> bool:
-        """Validate the response based on certain criteria"""
-        if len(response) < 5:
-            print("Response is too short")
-            return False
-        return True
+        for key, value in data.items():
+            setattr(self, key, value)
 
-    def print_history_and_memory(self):
-        """
-        Prints the entire history and memory of the agent.
-        Each message is colored and formatted for better readability.
-        """
-        print(colored("Agent History and Memory", "cyan", attrs=["bold"]))
-        print(colored("========================", "cyan", attrs=["bold"]))
-        for loop_index, history in enumerate(self.short_memory, start=1):
-            print(
-                colored(f"\nLoop {loop_index}:", "yellow", attrs=["bold"])
-            )
-            for message in history:
-                speaker, _, message_text = message.partition(": ")
-                if "Human" in speaker:
-                    print(
-                        colored(f"{speaker}:", "green")
-                        + f" {message_text}"
-                    )
-                else:
-                    print(
-                        colored(f"{speaker}:", "blue") + f" {message_text}"
-                    )
-            print(colored("------------------------", "cyan"))
-        print(colored("End of Agent History", "cyan", attrs=["bold"]))
+        return "Loaded agent history"
 
-    def step(self, task: str, **kwargs):
+    def step(self, task: str, *args, **kwargs):
         """
 
         Executes a single step in the agent interaction, generating a response
@@ -1133,9 +1089,9 @@ class Agent:
 
         """
         try:
-            logger.info(f"Running a single step: {task}")
+            logger.info(f"Running a step: {task}")
             # Generate the response using lm
-            response = self.llm(task, **kwargs)
+            response = self.llm(task, *args, **kwargs)
 
             # Update the agent's history with the new interaction
             if self.interactive:
@@ -1158,15 +1114,15 @@ class Agent:
         print(colored("Shutting down the system...", "red"))
         return self.save_state(f"{self.agent_name}.json")
 
-    def run_with_timeout(self, task: str, timeout: int = 60) -> str:
-        """Run the loop but stop if it takes longer than the timeout"""
-        start_time = time.time()
-        response = self.run(task)
-        end_time = time.time()
-        if end_time - start_time > timeout:
-            print("Operaiton timed out")
-            return "Timeout"
-        return response
+    # def run_with_timeout(self, task: str, timeout: int = 60) -> str:
+    #     """Run the loop but stop if it takes longer than the timeout"""
+    #     start_time = time.time()
+    #     response = self.run(task)
+    #     end_time = time.time()
+    #     if end_time - start_time > timeout:
+    #         print("Operaiton timed out")
+    #         return "Timeout"
+    #     return response
 
     def analyze_feedback(self):
         """Analyze the feedback for issues"""
@@ -1214,6 +1170,34 @@ class Agent:
         logger.info(f"Adding response filter: {filter_word}")
         self.reponse_filters.append(filter_word)
 
+    def code_interpreter_execution(
+        self, code: str, *args, **kwargs
+    ) -> str:
+        # Extract code from markdown
+        extracted_code = extract_code_from_markdown(code)
+
+        # Execute the code
+        execution = SubprocessCodeInterpreter(debug_mode=True).run(
+            extracted_code
+        )
+
+        # Add the execution to the memory
+        self.short_memory.add(
+            role=self.agent_name,
+            content=execution,
+        )
+
+        # Run the llm again
+        response = self.llm(
+            self.short_memory.return_history_as_string(),
+            *args,
+            **kwargs,
+        )
+
+        print(f"Response after code interpretation: {response}")
+
+        return response
+
     def apply_reponse_filters(self, response: str) -> str:
         """
         Apply the response filters to the response
@@ -1235,18 +1219,6 @@ class Agent:
         raw_response = self.run(task)
         return self.apply_response_filters(raw_response)
 
-    def interactive_run(self, max_loops: int = 5) -> None:
-        """Interactive run mode"""
-        logger.info("Running in interactive mode")
-        response = input("Start the cnversation")
-
-        for i in range(max_loops):
-            ai_response = self.streamed_generation(response)
-            print(f"AI: {ai_response}")
-
-            # Get user input
-            response = input("You: ")
-
     def save_to_yaml(self, file_path: str) -> None:
         """
         Save the agent to a YAML file
@@ -1264,7 +1236,7 @@ class Agent:
     def get_llm_parameters(self):
         return str(vars(self.llm))
 
-    def save_state(self, file_path: str, task: str = None) -> None:
+    def save_state(self, file_path: str, *args, **kwargs) -> None:
         """
         Saves the current state of the agent to a JSON file, including the llm parameters.
 
@@ -1278,101 +1250,20 @@ class Agent:
             logger.info(
                 f"Saving Agent {self.agent_name} state to: {file_path}"
             )
-            state = {
-                "agent_id": str(self.id),
-                "agent_name": self.agent_name,
-                "agent_description": self.agent_description,
-                "LLM": str(self.get_llm_parameters()),
-                "system_prompt": self.system_prompt,
-                "short_memory": self.short_memory.return_history_as_string(),
-                "loop_interval": self.loop_interval,
-                "retry_attempts": self.retry_attempts,
-                "retry_interval": self.retry_interval,
-                "interactive": self.interactive,
-                "dashboard": self.dashboard,
-                "dynamic_temperature": self.dynamic_temperature_enabled,
-                "autosave": self.autosave,
-                "saved_state_path": self.saved_state_path,
-                "max_loops": self.max_loops,
-                "StepCache": self.step_cache,
-                "Task": task,
-                "Stopping Token": self.stopping_token,
-                "Dynamic Loops": self.dynamic_loops,
-                "tools": self.tools,
-                "sop": self.sop,
-                "sop_list": self.sop_list,
-                "context_length": self.context_length,
-                "user_name": self.user_name,
-                "self_healing_enabled": self.self_healing_enabled,
-                "code_interpreter": self.code_interpreter,
-                "multi_modal": self.multi_modal,
-                "pdf_path": self.pdf_path,
-                "list_of_pdf": self.list_of_pdf,
-                "tokenizer": self.tokenizer,
-                "long_term_memory": self.long_term_memory,
-                "preset_stopping_token": self.preset_stopping_token,
-                "traceback": self.traceback,
-                "traceback_handlers": self.traceback_handlers,
-                "streaming_on": self.streaming_on,
-                "docs": self.docs,
-                "docs_folder": self.docs_folder,
-                "verbose": self.verbose,
-                "parser": self.parser,
-                "best_of_n": self.best_of_n,
-                "callback": self.callback,
-                "metadata": self.metadata,
-                "callbacks": self.callbacks,
-                # "logger_handler": self.logger_handler,
-                "search_algorithm": self.search_algorithm,
-                "logs_to_filename": self.logs_to_filename,
-                "evaluator": self.evaluator,
-                "output_json": self.output_json,
-                "stopping_func": self.stopping_func,
-                "custom_loop_condition": self.custom_loop_condition,
-                "sentiment_threshold": self.sentiment_threshold,
-                "custom_exit_command": self.custom_exit_command,
-                "sentiment_analyzer": self.sentiment_analyzer,
-                "limit_tokens_from_string": self.limit_tokens_from_string,
-                # "custom_tools_prompt": self.custom_tools_prompt,
-                "tool_schema": self.tool_schema,
-                "output_type": self.output_type,
-                "function_calling_type": self.function_calling_type,
-                "output_cleaner": self.output_cleaner,
-                "function_calling_format_type": self.function_calling_format_type,
-                "list_tool_schemas": self.list_tool_schemas,
-                "metadata_output_type": self.metadata_output_type,
-                "user_meta_data": get_user_device_data(),
-            }
 
-            # Save as JSON
-            if self.state_save_file_type == "json":
-                with open(file_path, "w") as f:
-                    json.dump(state, f, indent=4)
+            json_data = self.to_json()
 
-            # Save as YAML
-            elif self.state_save_file_type == "yaml":
-                out = YamlModel(input_dict=state).to_yaml()
-                with open(self.saved_state_path, "w") as f:
-                    f.write(out)
+            create_file_in_folder(
+                self.workspace_dir,
+                file_path,
+                str(json_data),
+            )
 
             # Log the saved state
-            saved = colored(f"Saved agent state to: {file_path}", "green")
-            print(saved)
+            logger.info(f"Saved agent state to: {file_path}")
         except Exception as error:
-            print(colored(f"Error saving agent state: {error}", "red"))
-
-    def state_to_str(self, task: str):
-        """Transform the JSON into a string"""
-        try:
-            out = self.save_state(self.saved_state_path, task)
-            return out
-        except Exception as error:
-            print(
-                colored(
-                    f"Error transforming state to string: {error}",
-                    "red",
-                )
-            )
+            logger.info(f"Error saving agent state: {error}")
+            raise error
 
     def load_state(self, file_path: str):
         """
@@ -1386,29 +1277,16 @@ class Agent:
 
         """
         try:
-            with open(file_path) as f:
-                state = json.load(f)
+            with open(file_path, "r") as file:
+                data = json.load(file)
 
-            # Restore other saved attributes
-            self.id = state.get("agent_id", self.id)
-            self.agent_name = state.get("agent_name", self.agent_name)
-            self.agent_description = state.get(
-                "agent_description", self.agent_description
-            )
-            self.system_prompt = state.get(
-                "system_prompt", self.system_prompt
-            )
-            self.sop = state.get("sop", self.sop)
-            self.short_memory = state.get("short_memory", [])
-            self.max_loops = state.get("max_loops", 5)
-            self.loop_interval = state.get("loop_interval", 1)
-            self.retry_attempts = state.get("retry_attempts", 3)
-            self.retry_interval = state.get("retry_interval", 1)
-            self.interactive = state.get("interactive", False)
+            for key, value in data.items():
+                setattr(self, key, value)
 
-            print(f"Agent state loaded from {file_path}")
+            logger.info(f"Agent state loaded from {file_path}")
         except Exception as error:
-            print(colored(f"Error loading agent state: {error}", "red"))
+            logger.info(f"Error loading agent state: {error}")
+            raise error
 
     def retry_on_failure(
         self,
@@ -1455,56 +1333,14 @@ class Agent:
         """Reset the agent"""
         self.short_memory = None
 
-    def run_code(self, code: str):
-        """
-        text -> parse_code by looking for code inside 6 backticks `````-> run_code
-        """
-        try:
-            logger.info(f"Running code: {code}")
-            parsed_code = extract_code_from_markdown(code)
-            run_code = self.code_executor.run(parsed_code)
-            return run_code
-        except Exception as error:
-            logger.debug(f"Error running code: {error}")
-
-    def pdf_connector(self, pdf: str = None):
-        """Transforms the pdf into text
-
-        Args:
-            pdf (str, optional): _description_. Defaults to None.
-
-        Returns:
-            _type_: _description_
-        """
-        try:
-            pdf = pdf or self.pdf_path
-            text = pdf_to_text(pdf)
-            return text
-        except Exception as error:
-            print(f"Error connecting to the pdf: {error}")
-            raise error
-
-    def pdf_chunker(self, text: str = None, num_limits: int = 1000):
-        """Chunk the pdf into sentences
-
-        Args:
-            text (str, optional): _description_. Defaults to None.
-
-        Returns:
-            _type_: _description_
-        """
-        text = text or self.pdf_connector()
-        text = self.limit_tokens_from_string(text, num_limits)
-        return text
-
     def ingest_docs(self, docs: List[str], *args, **kwargs):
         """Ingest the docs into the memory
 
         Args:
-            docs (List[str]): _description_
+            docs (List[str]): Documents of pdfs, text, csvs
 
         Returns:
-            _type_: _description_
+            None
         """
         try:
             for doc in docs:
@@ -1518,10 +1354,7 @@ class Agent:
         """Ingest the pdf into the memory
 
         Args:
-            pdf (str): _description_
-
-        Returns:
-            _type_: _description_
+            pdf (str): file path of pdf
         """
         try:
             logger.info(f"Ingesting pdf: {pdf}")
@@ -1530,13 +1363,14 @@ class Agent:
         except Exception as error:
             print(colored(f"Error ingesting pdf: {error}", "red"))
 
-    def receieve_mesage(self, name: str, message: str):
+    def receieve_message(self, name: str, message: str):
         """Receieve a message"""
         try:
             message = f"{name}: {message}"
             return self.short_memory.add(role=name, content=message)
         except Exception as error:
-            print(colored(f"Error receiving message: {error}", "red"))
+            logger.info(f"Error receiving message: {error}")
+            raise error
 
     def send_agent_message(
         self, agent_name: str, message: str, *args, **kwargs
@@ -1547,36 +1381,21 @@ class Agent:
             message = f"{agent_name}: {message}"
             return self.run(message, *args, **kwargs)
         except Exception as error:
-            print(colored(f"Error sending agent message: {error}", "red"))
+            logger.info(f"Error sending agent message: {error}")
+            raise error
 
-    def truncate_history(self):
-        """
-        Truncates the short-term memory of the agent based on the count of tokens.
-
-        The method counts the tokens in the short-term memory using the tokenizer and
-        compares it with the length of the memory. If the length of the memory is greater
-        than the count, the memory is truncated to match the count.
-
-        Parameters:
-            None
-
-        Returns:
-            None
-        """
-        # Count the short term history with the tokenizer
-        count = self.tokenizer.count_tokens(
-            self.short_memory.return_history_as_string()
-        )
-
-        # Now the logic that truncates the memory if it's more than the count
-        if len(self.short_memory) > count:
-            self.short_memory = self.short_memory[:count]
-
-    def add_tool(self, tool: BaseTool):
+    def add_tool(self, tool: Callable):
         return self.tools.append(tool)
 
-    def add_tools(self, tools: List[BaseTool]):
+    def add_tools(self, tools: List[Callable]):
         return self.tools.extend(tools)
+
+    def remove_tool(self, tool: Callable):
+        return self.tools.remove(tool)
+
+    def remove_tools(self, tools: List[Callable]):
+        for tool in tools:
+            self.tools.remove(tool)
 
     def get_docs_from_doc_folders(self):
         """Get the docs from the files"""
@@ -1597,3 +1416,606 @@ class Agent:
                     "red",
                 )
             )
+
+    def check_end_session_agentops(self):
+        if self.agent_ops_on is True:
+            try:
+                from swarms.utils.agent_ops_check import (
+                    end_session_agentops,
+                )
+
+                # Try ending the session
+                return end_session_agentops()
+            except ImportError:
+                logger.error(
+                    "Could not import agentops, try installing agentops: $ pip3 install agentops"
+                )
+
+    def convert_tool_into_openai_schema(self):
+        logger.info("Converting tools into OpenAI function calling schema")
+
+        # if callable(self.tools):
+        for tool in self.tools:
+            # Transform the tool into a openai function calling schema
+            name = tool.__name__
+            description = tool.__doc__
+            logger.info(
+                f"Converting tool: {name} into a OpenAI certified function calling schema. Add documentation and type hints."
+            )
+            tool_schema_list = get_openai_function_schema_from_func(
+                tool, name=name, description=description
+            )
+
+            # Transform the dictionary to a string
+            tool_schema_list = json.dumps(tool_schema_list, indent=4)
+
+            # Add the tool schema to the short memory
+            self.short_memory.add(role="System", content=tool_schema_list)
+
+            logger.info(
+                f"Conversion process successful, the tool {name} has been integrated with the agent successfully."
+            )
+
+        # else:
+        #     for tool in self.tools:
+
+        #         # Parse the json for the name of the function
+        #         name = tool["name"]
+        #         description = tool["description"]
+
+        #         # Transform the dict into a string
+        #         tool_schema_list = json.dumps(tool, indent=4)
+
+        #         # Add the tool schema to the short memory
+        #         self.short_memory.add(
+        #             role="System", content=tool_schema_list
+        #         )
+
+        #         logger.info(
+        #             f"Conversion process successful, the tool {name} has been integrated with the agent successfully."
+        #         )
+
+        return None
+
+    def memory_query(self, task: str = None, *args, **kwargs) -> str:
+        try:
+            # Query the long term memory
+            if self.long_term_memory is not None:
+                logger.info(f"Querying long term memory for: {task}")
+                memory_retrieval = self.long_term_memory.query(
+                    task, *args, **kwargs
+                )
+
+                memory_token_count = self.tokenizer.count_tokens(
+                    memory_retrieval
+                )
+
+                if memory_token_count > self.memory_chunk_size:
+                    # Truncate the memory by the memory chunk size
+                    memory_retrieval = self.truncate_string_by_tokens(
+                        memory_retrieval, self.memory_chunk_size
+                    )
+
+                # Merge the task prompt with the memory retrieval
+                task_prompt = (
+                    f"{task} Documents Available: {memory_retrieval}"
+                )
+
+                response = self.llm(task_prompt, *args, **kwargs)
+                print(response)
+
+                self.short_memory.add(
+                    role=self.agent_name, content=response
+                )
+
+                return response
+        except Exception as e:
+            print(f"An error occurred: {e}")
+            return None
+
+    def sentiment_analysis_handler(self, response: str = None):
+        try:
+            # Sentiment analysis
+            if self.sentiment_analyzer:
+                sentiment = self.sentiment_analyzer(response)
+                print(f"Sentiment: {sentiment}")
+
+                if sentiment > self.sentiment_threshold:
+                    print(
+                        f"Sentiment: {sentiment} is above"
+                        " threshold:"
+                        f" {self.sentiment_threshold}"
+                    )
+                elif sentiment < self.sentiment_threshold:
+                    print(
+                        f"Sentiment: {sentiment} is below"
+                        " threshold:"
+                        f" {self.sentiment_threshold}"
+                    )
+
+                # print(f"Sentiment: {sentiment}")
+                self.short_memory.add(
+                    role=self.agent_name,
+                    content=sentiment,
+                )
+        except Exception as e:
+            print(f"Error occurred during sentiment analysis: {e}")
+
+    def count_and_shorten_context_window(
+        self, history: str, *args, **kwargs
+    ):
+        """
+        Count the number of tokens in the context window and shorten it if it exceeds the limit.
+
+        Args:
+            history (str): The history of the conversation.
+
+        Returns:
+            str: The shortened context window.
+        """
+        # Count the number of tokens in the context window
+        count = self.tokenizer.count_tokens(history)
+
+        # Shorten the context window if it exceeds the limit, keeping the last n tokens, need to implement the indexing
+        if count > self.context_length:
+            history = history[-self.context_length :]
+
+        return history
+
+    def output_cleaner_and_output_type(
+        self, response: str, *args, **kwargs
+    ):
+        # Apply the cleaner function to the response
+        if self.output_cleaner is not None:
+            logger.info("Applying output cleaner to response.")
+            response = self.output_cleaner(response)
+            logger.info(f"Response after output cleaner: {response}")
+
+        # Prepare the output for the output model
+        if self.output_type is not None:
+            # logger.info("Preparing output for output model.")
+            response = prepare_output_for_output_model(response)
+            print(f"Response after output model: {response}")
+
+        return response
+
+    def stream_response(self, response: str, delay: float = 0.001) -> None:
+        """
+        Streams the response token by token.
+
+        Args:
+            response (str): The response text to be streamed.
+            delay (float, optional): Delay in seconds between printing each token. Default is 0.1 seconds.
+
+        Raises:
+            ValueError: If the response is not provided.
+            Exception: For any errors encountered during the streaming process.
+
+        Example:
+            response = "This is a sample response from the API."
+            stream_response(response)
+        """
+        # Check for required inputs
+        if not response:
+            raise ValueError("Response is required.")
+
+        try:
+            # Stream and print the response token by token
+            for token in response.split():
+                print(token, end=" ", flush=True)
+                time.sleep(delay)
+            print()  # Ensure a newline after streaming
+        except Exception as e:
+            print(f"An error occurred during streaming: {e}")
+
+    def dynamic_context_window(self):
+        """
+        dynamic_context_window essentially clears everything execep
+        the system prompt and leaves the rest of the contxt window
+        for RAG query tokens
+
+        """
+        # Count the number of tokens in the short term memory
+        logger.info("Dynamic context window shuffling enabled")
+        count = self.tokenizer.count_tokens(
+            self.short_memory.return_history_as_string()
+        )
+        logger.info(f"Number of tokens in memory: {count}")
+
+        # Dynamically allocating everything except the system prompt to be dynamic
+        # We need to query the short_memory dict, for the system prompt slot
+        # Then delete everything after that
+
+        if count > self.context_length:
+            self.short_memory = self.short_memory[-self.context_length :]
+            logger.info(
+                f"Short term memory has been truncated to {self.context_length} tokens"
+            )
+        else:
+            logger.info("Short term memory is within the limit")
+
+        # Return the memory as a string or update the short term memory
+        # return memory
+
+    def check_available_tokens(self):
+        # Log the amount of tokens left in the memory and in the task
+        if self.tokenizer is not None:
+            tokens_used = self.tokenizer.count_tokens(
+                self.short_memory.return_history_as_string()
+            )
+            logger.info(
+                f"Tokens available: {self.context_length - tokens_used}"
+            )
+
+        return tokens_used
+
+    def tokens_checks(self):
+        # Check the tokens available
+        tokens_used = self.tokenizer.count_tokens(
+            self.short_memory.return_history_as_string()
+        )
+        out = self.check_available_tokens()
+
+        logger.info(
+            f"Tokens available: {out} Context Length: {self.context_length} Tokens in memory: {tokens_used}"
+        )
+
+        return out
+
+    def truncate_string_by_tokens(
+        self, input_string: str, limit: int
+    ) -> str:
+        """
+        Truncate a string if it exceeds a specified number of tokens using a given tokenizer.
+
+        :param input_string: The input string to be tokenized and truncated.
+        :param tokenizer: The tokenizer function to be used for tokenizing the input string.
+        :param max_tokens: The maximum number of tokens allowed.
+        :return: The truncated string if it exceeds the maximum number of tokens; otherwise, the original string.
+        """
+        # Tokenize the input string
+        tokens = self.tokenizer.count_tokens(input_string)
+
+        # Check if the number of tokens exceeds the maximum limit
+        if len(tokens) > limit:
+            # Truncate the tokens to the maximum allowed tokens
+            truncated_tokens = tokens[: self.context_length]
+            # Join the truncated tokens back to a string
+            truncated_string = " ".join(truncated_tokens)
+            return truncated_string
+        else:
+            return input_string
+
+    def if_tokens_exceeds_context_length(self):
+        # Check if tokens exceeds the context length
+        try:
+            tokens_used = self.tokenizer.count_tokens(
+                self.short_memory.return_history_as_string()
+            )
+            if tokens_used > self.context_length:
+                logger.warning("Tokens used exceeds the context length.")
+                logger.info(
+                    f"Tokens available: {tokens_used - self.context_length}"
+                )
+                return True
+            else:
+                return False
+        except Exception as e:
+            logger.error(f"Error checking tokens: {e}")
+            return None
+
+    def tokens_operations(self, input_string: str) -> str:
+        """
+        Perform various operations on tokens of an input string.
+
+        :param input_string: The input string to be processed.
+        :return: The processed string.
+        """
+        # Tokenize the input string
+        tokens = self.tokenizer.count_tokens(input_string)
+
+        # Check if the number of tokens exceeds the maximum limit
+        if len(tokens) > self.context_length:
+            # Truncate the tokens to the maximum allowed tokens
+            truncated_tokens = tokens[: self.context_length]
+            # Join the truncated tokens back to a string
+            truncated_string = " ".join(truncated_tokens)
+            return truncated_string
+        else:
+            # Log the amount of tokens left in the memory and in the task
+            if self.tokenizer is not None:
+                tokens_used = self.tokenizer.count_tokens(
+                    self.short_memory.return_history_as_string()
+                )
+                logger.info(
+                    f"Tokens available: {tokens_used - self.context_length}"
+                )
+            return input_string
+
+    def parse_function_call_and_execute(self, response: str):
+        """
+        Parses a function call from the given response and executes it.
+
+        Args:
+            response (str): The response containing the function call.
+
+        Returns:
+            None
+
+        Raises:
+            Exception: If there is an error parsing and executing the function call.
+        """
+        try:
+            if self.tools is not None:
+                tool_call_output = parse_and_execute_json(
+                    self.tools, response, parse_md=True
+                )
+
+                if tool_call_output is not str:
+                    tool_call_output = str(tool_call_output)
+
+                logger.info(f"Tool Call Output: {tool_call_output}")
+                self.short_memory.add(
+                    role=self.agent_name,
+                    content=tool_call_output,
+                )
+
+                return tool_call_output
+        except Exception as error:
+            logger.error(
+                f"Error parsing and executing function call: {error}"
+            )
+
+            # Raise a custom exception with the error message
+            raise Exception(
+                "Error parsing and executing function call"
+            ) from error
+
+    def activate_agentops(self):
+        if self.agent_ops_on is True:
+            try:
+                from swarms.utils.agent_ops_check import (
+                    try_import_agentops,
+                )
+
+                # Try importing agent ops
+                logger.info(
+                    "Agent Ops Initializing, ensure that you have the agentops API key and the pip package installed."
+                )
+                try_import_agentops()
+                self.agent_ops_agent_name = self.agent_name
+
+                logger.info("Agentops successfully activated!")
+            except ImportError:
+                logger.error(
+                    "Could not import agentops, try installing agentops: $ pip3 install agentops"
+                )
+
+    def handle_multiple_base_models(self) -> None:
+        try:
+            # If a list of tool schemas is provided
+            logger.info("Adding multiple base models as tools --->")
+            if exists(self.list_base_models):
+                logger.info(
+                    "List of tool schemas provided, Automatically converting to OpenAI function"
+                )
+                tool_schemas = multi_base_model_to_openai_function(
+                    self.list_base_models
+                )
+
+                # Convert the tool schemas to a string
+                tool_schemas = json.dumps(tool_schemas, indent=4)
+
+                # Add the tool schema to the short memory
+                logger.info("Adding tool schema to short memory")
+                self.short_memory.add(
+                    role=self.user_name, content=tool_schemas
+                )
+
+                return logger.info(
+                    "Successfully integrated multiple tools"
+                )
+        except Exception as error:
+            logger.info(
+                f"Error with the base models, check the base model types and make sure they are initialized {error}"
+            )
+            raise error
+
+    async def count_tokens_and_subtract_from_context_window(
+        self, response: str, *args, **kwargs
+    ):
+        """
+        Count the number of tokens in the response and subtract it from the context window.
+
+        Args:
+            response (str): The response to count the tokens from.
+
+        Returns:
+            str: The response after counting the tokens and subtracting it from the context window.
+        """
+        # Count the number of tokens in the response
+        tokens = self.tokenizer.count_tokens(response)
+
+        # Subtract the number of tokens from the context window
+        self.context_length -= len(tokens)
+
+        return response
+
+    def llm_output_parser(self, response: Any) -> str:
+        """
+        Parses the response from the LLM (Low-Level Monitor) and returns it as a string.
+
+        Args:
+            response (Any): The response from the LLM.
+
+        Returns:
+            str: The parsed response as a string.
+        """
+        if response is not str:
+            response = str(response)
+
+        return response
+
+    # def to_dict(self) -> Dict[str, Any]:
+    #     """
+    #     Converts all attributes of the class, including callables, into a dictionary.
+    #     Handles non-serializable attributes by converting them or skipping them.
+
+    #     Returns:
+    #         Dict[str, Any]: A dictionary representation of the class attributes.
+    #     """
+    #     result = {}
+    #     for attr_name, attr_value in self.__dict__.items():
+    #         try:
+    #             if callable(attr_value):
+    #                 result[attr_name] = {
+    #                     "name": getattr(
+    #                         attr_value,
+    #                         "__name__",
+    #                         type(attr_value).__name__,
+    #                     ),
+    #                     "doc": getattr(attr_value, "__doc__", None),
+    #                 }
+    #             else:
+    #                 result[attr_name] = attr_value
+    #         except TypeError:
+    #             # Handle non-serializable attributes
+    #             result[attr_name] = (
+    #                 f"<Non-serializable: {type(attr_value).__name__}>"
+    #             )
+    #     return result
+
+    def log_step_metadata(self, response: str) -> Step:
+        # # Step Metadata
+        full_memory = self.short_memory.return_history_as_string()
+        prompt_tokens = self.tokenizer.count_tokens(full_memory)
+        completion_tokens = self.tokenizer.count_tokens(response)
+        total_tokens = self.tokenizer.count_tokens(
+            prompt_tokens + completion_tokens
+        )
+
+        logger.info("Logging step metadata...")
+
+        return Step(
+            # token_count = self.tokenizer.count_tokens(response),
+            # cost_in_dollar = self.tokenizer.calculate_cost(response)
+            response=AgentChatCompletionResponse(
+                id=self.agent_id,
+                agent_name=self.agent_name,
+                object="chat.completion",
+                choices=[
+                    ChatCompletionResponseChoice(
+                        index=0,
+                        message=ChatMessageResponse(
+                            role=self.agent_name,
+                            content=response,
+                        ),
+                    )
+                ],
+                usage=UsageInfo(
+                    prompt_tokens=prompt_tokens,
+                    total_tokens=total_tokens,
+                    completion_tokens=completion_tokens,
+                ),
+            ),
+        )
+
+    def _serialize_callable(self, attr_value: Callable) -> Dict[str, Any]:
+        """
+        Serializes callable attributes by extracting their name and docstring.
+
+        Args:
+            attr_value (Callable): The callable to serialize.
+
+        Returns:
+            Dict[str, Any]: Dictionary with name and docstring of the callable.
+        """
+        return {
+            "name": getattr(
+                attr_value, "__name__", type(attr_value).__name__
+            ),
+            "doc": getattr(attr_value, "__doc__", None),
+        }
+
+    def _serialize_attr(self, attr_name: str, attr_value: Any) -> Any:
+        """
+        Serializes an individual attribute, handling non-serializable objects.
+
+        Args:
+            attr_name (str): The name of the attribute.
+            attr_value (Any): The value of the attribute.
+
+        Returns:
+            Any: The serialized value of the attribute.
+        """
+        try:
+            if callable(attr_value):
+                return self._serialize_callable(attr_value)
+            elif hasattr(attr_value, "to_dict"):
+                return (
+                    attr_value.to_dict()
+                )  # Recursive serialization for nested objects
+            else:
+                json.dumps(
+                    attr_value
+                )  # Attempt to serialize to catch non-serializable objects
+                return attr_value
+        except (TypeError, ValueError):
+            return f"<Non-serializable: {type(attr_value).__name__}>"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Converts all attributes of the class, including callables, into a dictionary.
+        Handles non-serializable attributes by converting them or skipping them.
+
+        Returns:
+            Dict[str, Any]: A dictionary representation of the class attributes.
+        """
+        return {
+            attr_name: self._serialize_attr(attr_name, attr_value)
+            for attr_name, attr_value in self.__dict__.items()
+        }
+
+    def to_json(self, indent: int = 4, *args, **kwargs):
+        return json.dumps(self.to_dict(), indent=indent, *args, **kwargs)
+
+    def to_yaml(self, indent: int = 4, *args, **kwargs):
+        return yaml.dump(self.to_dict(), indent=indent, *args, **kwargs)
+
+    def to_toml(self, *args, **kwargs):
+        return toml.dumps(self.to_dict(), *args, **kwargs)
+
+    def model_dump_json(self):
+        logger.info(
+            f"Saving {self.agent_name} model to JSON in the {self.workspace_dir} directory"
+        )
+
+        create_file_in_folder(
+            self.workspace_dir,
+            f"{self.agent_name}.json",
+            str(self.to_json()),
+        )
+
+        return (
+            f"Model saved to {self.workspace_dir}/{self.agent_name}.json"
+        )
+
+    def model_dump_yaml(self):
+        logger.info(
+            f"Saving {self.agent_name} model to YAML in the {self.workspace_dir} directory"
+        )
+
+        create_file_in_folder(
+            self.workspace_dir,
+            f"{self.agent_name}.yaml",
+            self.to_yaml(),
+        )
+
+        return (
+            f"Model saved to {self.workspace_dir}/{self.agent_name}.yaml"
+        )
+
+    # def publish_agent_to_marketplace(self):
+    #     import requests
+
+    #     # Prepare the data

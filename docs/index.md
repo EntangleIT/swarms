@@ -1,89 +1,36 @@
-<div align="center">
-  <p>
-    <a align="center" href="" target="_blank">
-      <img
-        width="850"
-        src="https://github.com/kyegomez/swarms/raw/master/images/swarmslogobanner.png"
-      >
-    </a>
-  </p>
-</div>
+# Welcome to Swarms Docs Home
 
-## 👋 Hello
+**Get Started Building Production-Grade Multi-Agent Applications**
 
-Swarms provides you with all the building blocks you need to build reliable, production-grade, and scalable multi-agent apps!
+## Getting Started
 
-## 💻 Install
+Here you'll find references about the Swarms framework, marketplace, community, and more to enable you to build your multi-agent applications.
 
-You can install `swarms` with pip in a
-[**Python>=3.8**](https://www.python.org/) environment.
-
-!!! example "pip install (recommended)"
-
-    === "headless"
-        The headless installation of `swarms` is designed for environments where graphical user interfaces (GUI) are not needed, making it more lightweight and suitable for server-side applications.
-
-        ```bash
-        pip install swarms
-        ```
+| Section              | Links                                                                                      |
+|----------------------|--------------------------------------------------------------------------------------------|
+| Swarms Python Framework Docs     | [Framework Docs](https://docs.swarms.world/en/latest/swarms/install/install/)                                                            |
+| Swarms Marketplace API Docs   | [Swarms Marketplace](https://docs.swarms.world/en/latest/swarms_platform/)                                                 |
+| Swarms Cloud Docs       | [Swarms Pricing](https://docs.swarms.world/en/latest/swarms_cloud/main/)                                             |
 
 
-!!! example "git clone (for development)"
-
-    === "virtualenv"
-
-        ```bash
-        # clone repository and navigate to root directory
-        git clone https://github.com/kyegomez/swarms.git
-        cd swarms
-
-        # setup python environment and activate it
-        python3 -m venv venv
-        source venv/bin/activate
-        pip install --upgrade pip
-
-        # headless install
-        pip install -e "."
-
-        # desktop install
-        pip install -e ".[desktop]"
-        ```
-
-    === "poetry"
-
-        ```bash
-        # clone repository and navigate to root directory
-        git clone https://github.com/kyegomez/swarms.git
-        cd swarms
-
-        # setup python environment and activate it
-        poetry env use python3.10
-        poetry shell
-
-        # headless install
-        poetry install
-
-        # desktop install
-        poetry install --extras "desktop"
-        ```
-
-!!! example "NPM install |WIP|"
-
-    === "headless"
-        Get started with the NPM implementation of Swarms with this command:
-
-        ```bash
-        npm install swarms-js
-        ```
+## Community
+| Section              | Links                                                                                      |
+|----------------------|--------------------------------------------------------------------------------------------|
+| Community            | [Discord](https://discord.com/servers/agora-999382051935506503)                            |
+| Blog                 | [Blog](https://medium.com/@kyeg)                                                           |
+| Social Media         | [Twitter](https://x.com/swarms_corp)                                                       |
+| Event Calendar       | [Twitter](https://lu.ma/user/usr-GPa2xaC3pL1Hunp)                                                       |
 
 
-## Documentation
 
-[Learn more about swarms →](swarms/)
+## Github Repos
+| Section              | Links                                                                                      |
+|----------------------|--------------------------------------------------------------------------------------------|
+| Swarms Platform Github      | [Swarms Platform GitHub](https://github.com/kyegomez/swarms-platform)                      |
+| Swarms Python Framework Github      | [Swarms GitHub](https://github.com/kyegomez/swarms)                      |
+| Swarms Memory Python Framework     | [Swarms Memory GitHub](https://github.com/The-Swarm-Corporation/swarms-memory)                      |
+| Swarms Corp Github Profile     | [Swarms Corp GitHub](https://github.com/The-Swarm-Corporation)                      |
 
+## Get Support
 
-## Examples
-
-Check out Swarms examples for building agents, data retrieval, and more.
-
-[Checkout Swarms examples →](examples/)
+Want to get in touch with the Swarms team? Open an issue on [GitHub](https://github.com/kyegomez/swarms/issues/new) or reach out to us via [email](mailto:kye@swarms.world). We're here to help!
